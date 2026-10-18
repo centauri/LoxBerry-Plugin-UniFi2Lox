@@ -40,9 +40,11 @@ PROVIDERS = {
 }
 DEFAULTS = dict(mode='off', domain='', listen_port=8443, public_port=8443,
                 snapshot_port=80, certificate_mode='dns', provider='cloudflare',
-                email='', staging=True, terms=False, external_url='')
+                email='', staging=False, terms=False, external_url='', dns_resolvers='')
 CA = {'staging': 'https://acme-staging-v02.api.letsencrypt.org/directory',
       'production': 'https://acme-v02.api.letsencrypt.org/directory'}
+RENEW_BEFORE = 30 * 86400
+RENEW_RETRY = 12 * 3600
 
 
 class Error(Exception):
@@ -127,6 +129,29 @@ def validate_settings(data):
         raise Error('Invalid certificate method.')
     if c['provider'] not in PROVIDERS:
         raise Error('Unsupported DNS provider.')
+    raw = c['dns_resolvers']
+    if not isinstance(raw, str) or len(raw) > 512:
+        raise Error('Invalid DNS resolvers.')
+    resolvers = []
+    if raw.strip():
+        for item in raw.split(','):
+            item = item.strip()
+            try:
+                address, separator, number = item.rpartition(':')
+                if not separator or not number.isascii() or not number.isdecimal():
+                    raise ValueError()
+                ip = ipaddress.ip_address(address[1:-1] if address.startswith('[') and address.endswith(']') else address)
+                if ip.version == 6 and not (address.startswith('[') and address.endswith(']')):
+                    raise ValueError()
+                if '%' in address:
+                    raise ValueError()
+                number = port(number)
+                resolvers.append(('[' + str(ip) + ']' if ip.version == 6 else str(ip)) + ':' + str(number))
+            except (ValueError, Error):
+                raise Error('Use DNS resolver IP:port, for example 1.1.1.1:53 or [2606:4700:4700::1111]:53.')
+        if len(resolvers) > 4:
+            raise Error('Use at most four DNS resolvers.')
+    c['dns_resolvers'] = ','.join(resolvers)
     for key in ('staging', 'terms'):
         if not isinstance(c[key], bool):
             raise Error('Invalid boolean setting.')
@@ -312,7 +337,29 @@ class Manager:
         return dict(ok=True, settings=c, running=bool(self.process()), certificate=cert,
                     tools={n: (self.tools / n).is_file() for n in ('caddy', 'lego')},
                     providers=PROVIDERS, has_credentials={k: bool(v) for k, v in stored.items()},
-                    job=self.job(), links=links, service=read_json(self.state))
+                    job=self.job(), links=links, service=read_json(self.state),
+                    renewal=self.renewal_status())
+
+    def renewal_status(self):
+        c = self.settings()
+        active = read_json(self.active_file)
+        history = read_json(self.base / 'renewal.json')
+        reason = ''
+        if c['certificate_mode'] != 'dns':
+            reason = 'Manual DNS and imported certificates require manual renewal.'
+        elif c['mode'] != 'managed' or not read_json(self.base / 'enabled.json').get('enabled'):
+            reason = 'Enable managed HTTPS to activate automatic renewal.'
+        elif (self.data / 'stopped.flag').exists() or not self.plugin().get('server', {}).get('enabled', True):
+            reason = 'Automatic renewal is paused while the camera service is stopped.'
+        elif not active:
+            reason = 'Request the first certificate and enable HTTPS.'
+        elif active.get('domain') != c['domain'] or active.get('staging', False) != c['staging']:
+            reason = 'Request a certificate matching the saved hostname and staging setting.'
+        due = active.get('expires', 0) - RENEW_BEFORE if active else None
+        return dict(enabled=not reason, reason=reason, due_at=due,
+                    next_attempt_at=max(due, history.get('attempt', 0) + RENEW_RETRY) if due is not None else None,
+                    last_attempt=history.get('attempt'), last_success=history.get('success'),
+                    result=history.get('result'), message=history.get('message', ''))
 
     def save(self, payload):
         with lock(self.base / 'operation.lock'):
@@ -338,13 +385,15 @@ class Manager:
             write_private(self.base / 'enabled.json', {'enabled': False})
         return self.status()
 
-    def enqueue(self, operation):
+    def enqueue(self, operation, automatic=False):
         if operation not in ('install', 'issue'):
             raise Error('Invalid operation.')
         with lock(self.base / 'operation.lock'):
             if self.job().get('phase') == 'queued' and time.time() - self.job().get('created', 0) < 15:
                 raise Error('An operation is already queued.')
             c = self.settings()
+            if automatic and (operation != 'issue' or not self.renewal_status()['enabled']):
+                raise Error('Automatic renewal is no longer enabled.')
             if operation == 'issue':
                 if c['mode'] != 'managed' or c['certificate_mode'] == 'import':
                     raise Error('Select managed HTTPS and a DNS certificate method first.')
@@ -358,7 +407,7 @@ class Manager:
                         raise Error('Enter the DNS provider credentials first.')
             ident = secrets.token_hex(12)
             private_dir(self.base / 'jobs' / ident)
-            j = dict(id=ident, operation=operation, created=time.time(), phase='queued')
+            j = dict(id=ident, operation=operation, created=time.time(), phase='queued', automatic=automatic)
             write_private(self.base / 'job.json', j)
             write_private(self.base / 'jobs' / ident / 'state.json', j)
             env = dict(os.environ, LBHOMEDIR=str(self.home))
@@ -423,8 +472,16 @@ class Manager:
         if not re.fullmatch('[a-f0-9]{24}', ident):
             return
         jobdir = self.base / 'jobs' / ident
+        job = {}
         def update(phase, message=''):
             write_private(jobdir / 'state.json', {'phase': phase, 'message': message})
+            if job.get('automatic') and phase in ('ready', 'failed'):
+                with lock(self.base / 'renewal.lock', blocking=True):
+                    history = read_json(self.base / 'renewal.json')
+                    history.update(result=phase, message=message)
+                    if phase == 'ready':
+                        history['success'] = time.time()
+                    write_private(self.base / 'renewal.json', history)
         try:
             with lock(self.base / 'operation.lock', blocking=True):
                 job = read_json(self.base / 'job.json')
@@ -467,6 +524,8 @@ class Manager:
         args = [str(self.tools / 'lego'), 'run', '--path', str(account), '--server', CA[stage],
                 '--email', c['email'], '--accept-tos', '--domains', c['domain'],
                 '--dns', provider, '--renew-days', '30']
+        if c['dns_resolvers']:
+            args.extend(['--dns.resolvers', c['dns_resolvers']])
         try:
             # Bounded interactive job; no credentials or client log in global logs.
             with tempfile.TemporaryFile() as output:
@@ -488,6 +547,10 @@ class Manager:
                         proc.wait()
                     raise Error('Certificate request cancelled or timed out. Request a new challenge.')
                 if rc:
+                    output.seek(0, os.SEEK_END)
+                    output.seek(max(0, output.tell() - 32768))
+                    if b'recursive nameservers:' in output.read():
+                        raise Error('DNS propagation check failed at a recursive resolver. Check the Certificate DNS resolvers setting; try 1.1.1.1:53 if local DNS does not return public TXT records.')
                     raise Error('Certificate request failed. Check DNS credentials/records and propagation; then retry.')
             cert = account / 'certificates' / (c['domain'] + '.crt')
             key = account / 'certificates' / (c['domain'] + '.key')
@@ -644,14 +707,25 @@ class Manager:
             # change. A valid certificate generation remains available on disk.
             self.stop()
             write_private(self.state, {'error': 'HTTPS could not be applied. Check settings, certificate and port.'})
-        active = read_json(self.active_file)
-        # Automatic renewal only for API providers, with bounded retry frequency.
-        last = read_json(self.base / 'renewal.json').get('attempt', 0)
-        if (c['certificate_mode'] == 'dns' and active and
-                active.get('expires', 0) - time.time() < 30 * 86400 and
-                time.time() - last > 12 * 3600 and not self.job_running()):
-            write_private(self.base / 'renewal.json', {'attempt': time.time()})
-            self.enqueue('issue')
+        # Serialize overlapping watchdogs; a busy issuance must not consume the
+        # retry window. Persist attempts across restarts, and never force issuance.
+        try:
+            with lock(self.base / 'renewal.lock'):
+                renewal = self.renewal_status()
+                if (not renewal['enabled'] or time.time() < renewal['next_attempt_at'] or
+                        self.job_running() or self.job().get('phase') == 'queued'):
+                    return
+                previous = read_json(self.base / 'renewal.json')
+                write_private(self.base / 'renewal.json', dict(previous, attempt=time.time(), result='queued', message=''))
+                try:
+                    self.enqueue('issue', automatic=True)
+                except Exception:
+                    write_private(self.base / 'renewal.json', previous)
+                    raise
+        except Error:
+            # Another watchdog or interactive operation may own a lock. Retry on
+            # the next minute tick without disrupting the existing gateway.
+            return
 
 
 def main():

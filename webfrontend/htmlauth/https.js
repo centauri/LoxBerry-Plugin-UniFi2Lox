@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const fields = ['mode','domain','listen_port','public_port','snapshot_port','certificate_mode','provider','email','staging','terms','external_url'];
+  const fields = ['mode','domain','listen_port','public_port','snapshot_port','certificate_mode','provider','email','staging','terms','external_url','dns_resolvers'];
   let state, busy = false, dirty = false;
   async function api(action, data) {
     const options = action === 'status' ? {} : {method:'POST', headers:{'Content-Type':'application/json','X-U2L-HTTPS':'1'}, body:JSON.stringify(data || {})};
@@ -46,14 +46,22 @@
       for (const key of fields) {
         const el = $(key); if (el.type === 'checkbox') el.checked = state.settings[key]; else el.value = state.settings[key];
       }
+      $('certificate-advanced').open = state.settings.staging;
       providerFields(); visibility(); dirty = false;
     }
     const cert = state.certificate;
+    const renewal = state.renewal;
+    const renewalText = renewal.enabled
+      ? 'Automatic renewal: active — from 30 days before expiry; next attempt no earlier than ' + new Date(renewal.next_attempt_at * 1000).toLocaleString()
+      : 'Automatic renewal: inactive — ' + renewal.reason;
     $('status').textContent = [
       'HTTPS service: ' + (state.running ? 'running' : 'stopped'),
       'Tools: ' + Object.entries(state.tools).map(([k,v]) => k + (v ? ' installed' : ' missing')).join(', '),
       cert ? (cert.error || 'Certificate expires: ' + new Date(cert.expires * 1000).toLocaleString() + (cert.staging ? ' — STAGING / NOT TRUSTED' : '')) : 'No certificate installed.',
       state.service.error || '',
+      renewalText,
+      renewal.last_success ? 'Last successful automatic renewal check: ' + new Date(renewal.last_success * 1000).toLocaleString() : '',
+      renewal.result === 'failed' ? 'Last automatic renewal failed: ' + renewal.message + ' The existing certificate is retained; retry after 12 hours.' : '',
       state.job.phase ? 'Certificate/tools job: ' + state.job.phase + (state.job.message ? ' — ' + state.job.message : '') : ''
     ].filter(Boolean).join('\n');
     $('expiry').hidden = !cert || cert.days_remaining > 30 || !!cert.error;

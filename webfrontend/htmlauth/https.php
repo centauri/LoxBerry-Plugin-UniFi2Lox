@@ -27,7 +27,9 @@ LBWeb::lbheader('UniFi2Lox — HTTPS', 'https://github.com/pschoenbi/LoxBerry-Pl
 <label>Certificate method<select id="certificate_mode" data-role="none"><option value="dns">Automatic DNS validation</option><option value="manual">Manual DNS TXT challenge (any DNS provider)</option><option value="import">Import an existing certificate</option></select></label>
 <div id="acme">
 <label>Email for the certificate account<input id="email" type="email" data-role="none"></label>
-<label><input id="staging" type="checkbox" data-role="none"> Test with Let's Encrypt staging (certificate is NOT trusted by browsers/apps)</label>
+<label>Certificate DNS resolvers (optional)<input id="dns_resolvers" type="text" placeholder="1.1.1.1:53" autocomplete="off" data-role="none"></label>
+<p class="note">Leave blank to use system DNS. If local DNS hides public TXT records, enter a reachable public resolver such as 1.1.1.1:53. Separate multiple IP:port entries with commas; use [IPv6]:port for IPv6. Applies to certificate requests and renewals only; system DNS stays unchanged.</p>
+<details id="certificate-advanced"><summary>Advanced certificate testing</summary><label><input id="staging" type="checkbox" data-role="none"> Use Let's Encrypt staging for testing (certificate is NOT trusted by browsers/apps)</label><p class="note">Leave this off for normal use. Changing this setting requires requesting a certificate from the selected environment.</p></details>
 <label><input id="terms" type="checkbox" data-role="none"> I accept the <a href="https://letsencrypt.org/repository/" target="_blank" rel="noopener noreferrer">Let's Encrypt terms</a> and authorize requests for this hostname.</label>
 </div>
 <div id="dns"><label>DNS provider<select id="provider" data-role="none"></select></label><p id="provider-help"></p><div id="credentials"></div><label><input id="clear_credentials" type="checkbox" data-role="none"> Remove all saved DNS credentials</label><p class="note">Credentials stay on this LoxBerry and are never returned to the browser. Leave fields blank to keep saved values. Enter tokens here, never in a support chat.</p></div>
@@ -46,5 +48,5 @@ LBWeb::lbheader('UniFi2Lox — HTTPS', 'https://github.com/pschoenbi/LoxBerry-Pl
 </fieldset>
 <h3>External camera links</h3><p>Use the camera username and password from the main plugin settings. These links do not contain credentials.</p><div id="links"></div>
 </div>
-<script src="https.js"></script>
+<script src="https.js?v=1.1.2.5"></script>
 <?php LBWeb::lbfooter(); ?>

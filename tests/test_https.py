@@ -18,6 +18,18 @@ import https_dns_hook as hook
 
 
 class SettingsTests(unittest.TestCase):
+    def test_production_default_preserves_explicit_staging_choice(self):
+        self.assertFalse(h.validate_settings({})['staging'])
+        self.assertTrue(h.validate_settings({'staging': True})['staging'])
+        self.assertFalse(h.validate_settings({'staging': False})['staging'])
+
+    def test_certificate_resolvers_validate_and_preserve_system_default(self):
+        self.assertEqual(h.validate_settings({})['dns_resolvers'], '')
+        self.assertEqual(h.validate_settings({'dns_resolvers':' 1.1.1.1:53, [2606:4700:4700::1111]:53 '})['dns_resolvers'], '1.1.1.1:53,[2606:4700:4700::1111]:53')
+        for bad in [None, [], 'example.com:53', '1.1.1.1', '1.1.1.1:0', '1.1.1.1:65536', '1.1.1.1:53,', '::1:53', 'https://1.1.1.1:53', '1.1.1.1:53;id', ','.join(['1.1.1.1:53'] * 5)]:
+            with self.subTest(bad=bad), self.assertRaises(h.Error):
+                h.validate_settings({'dns_resolvers':bad})
+
     def test_hostname_validation(self):
         self.assertEqual(h.domain_name('Camera.Example.com.'), 'camera.example.com')
         for bad in ['127.0.0.1', '*.example.com', 'a..com', '-a.com', 'a-.com',
@@ -55,7 +67,7 @@ class ManagerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='u2l-', dir='/tmp')
         self.m = h.Manager(self.tmp.name, 'u2l')
-        self.settings = h.validate_settings(dict(mode='managed',domain='camera.example.test', email='test@example.test',terms=True))
+        self.settings = h.validate_settings(dict(mode='managed',domain='camera.example.test', email='test@example.test',terms=True,staging=True))
         h.write_private(self.m.settings_file, self.settings)
         h.write_private(self.m.home/'config/plugins/u2l/config.json', dict(server=dict(enabled=True,port=1984,username='viewer',password='testpass'),cameras=[dict(enabled=True,slug='front',name='Front')]))
     def tearDown(self):
@@ -118,15 +130,65 @@ class ManagerTests(unittest.TestCase):
 
     def test_only_dns_mode_renews_and_retries_are_bounded(self):
         h.write_private(self.m.base/'enabled.json',dict(enabled=True))
-        h.write_private(self.m.active_file,dict(expires=time.time()+86400))
+        h.write_private(self.m.active_file,dict(expires=time.time()+86400,domain=self.settings['domain'],staging=True))
         with patch.object(self.m,'apply'), patch.object(self.m,'enqueue') as enqueue:
             self.m.watchdog(); self.m.watchdog()
-            enqueue.assert_called_once_with('issue')
+            enqueue.assert_called_once_with('issue', automatic=True)
         self.settings['certificate_mode']='manual'
         h.write_private(self.m.settings_file,self.settings)
         h.write_private(self.m.base/'renewal.json',dict(attempt=0))
         with patch.object(self.m,'apply'), patch.object(self.m,'enqueue') as enqueue:
             self.m.watchdog(); enqueue.assert_not_called()
+
+    def test_renewal_waits_for_window_and_survives_restart(self):
+        h.write_private(self.m.base/'enabled.json',dict(enabled=True))
+        active=dict(expires=time.time()+60*86400, domain=self.settings['domain'],staging=True)
+        h.write_private(self.m.active_file,active)
+        with patch.object(self.m,'apply'), patch.object(self.m,'enqueue') as enqueue:
+            self.m.watchdog(); enqueue.assert_not_called()
+            active['expires']=time.time()+86400
+            h.write_private(self.m.active_file,active)
+            self.m.watchdog(); enqueue.assert_called_once_with('issue',automatic=True)
+        restarted=h.Manager(self.tmp.name,'u2l')
+        with patch.object(restarted,'apply'), patch.object(restarted,'enqueue') as enqueue:
+            restarted.watchdog(); enqueue.assert_not_called()
+            history=h.read_json(restarted.base/'renewal.json')
+            history['attempt']-=h.RENEW_RETRY+1
+            h.write_private(restarted.base/'renewal.json',history)
+            restarted.watchdog(); enqueue.assert_called_once_with('issue',automatic=True)
+
+    def test_busy_or_failed_dispatch_does_not_delay_next_attempt(self):
+        h.write_private(self.m.base/'enabled.json',dict(enabled=True))
+        h.write_private(self.m.active_file,dict(expires=time.time()+86400,domain=self.settings['domain'],staging=True))
+        with patch.object(self.m,'apply'), patch.object(self.m,'enqueue') as enqueue:
+            with h.lock(self.m.base/'operation.lock'):
+                self.m.watchdog()
+            with h.lock(self.m.base/'renewal.lock'):
+                self.m.watchdog()
+            enqueue.assert_not_called()
+            self.assertFalse((self.m.base/'renewal.json').exists())
+            enqueue.side_effect=h.Error('Operation is busy')
+            self.m.watchdog()
+            self.assertFalse(h.read_json(self.m.base/'renewal.json').get('attempt'))
+            enqueue.side_effect=None
+            self.m.watchdog()
+            self.assertEqual(enqueue.call_count,2)
+
+    def test_automatic_renewal_paused_for_stopped_or_mismatched_configuration(self):
+        h.write_private(self.m.base/'enabled.json',dict(enabled=True))
+        active=dict(expires=time.time()+86400,domain=self.settings['domain'],staging=True)
+        h.write_private(self.m.active_file,active)
+        self.assertTrue(self.m.renewal_status()['enabled'])
+        for changes in [dict(domain='another.example.test'),dict(staging=False)]:
+            h.write_private(self.m.active_file,dict(active,**changes))
+            self.assertFalse(self.m.renewal_status()['enabled'])
+        h.write_private(self.m.active_file,active)
+        self.m.data.mkdir(parents=True,exist_ok=True)
+        (self.m.data/'stopped.flag').touch()
+        self.assertFalse(self.m.renewal_status()['enabled'])
+        (self.m.data/'stopped.flag').unlink()
+        h.write_private(self.m.base/'enabled.json',dict(enabled=False))
+        self.assertFalse(self.m.renewal_status()['enabled'])
 
     def test_issue_uses_pinned_cli_and_secret_files_not_arguments(self):
         h.write_private(self.m.base/'secrets.json',{'CF_DNS_API_TOKEN':'secret-token'})
@@ -146,6 +208,19 @@ class ManagerTests(unittest.TestCase):
         self.assertNotIn('secret-token',repr(captured['env']))
         self.assertEqual(captured['secret'],'secret-token')
         self.assertFalse((jobdir/'credentials').exists())
+        self.assertNotIn('--dns.resolvers', captured['args'])
+        for method in ['dns', 'manual']:
+            self.settings.update(dns_resolvers='1.1.1.1:53', certificate_mode=method)
+            h.write_private(self.m.settings_file,self.settings)
+            def fail(args, **kwargs):
+                captured['args'] = args
+                kwargs['stdout'].write(b'recursive nameservers: secret-token record missing')
+                return type('Failed', (), {'returncode': 1, 'poll': lambda self: 1})()
+            with patch.object(h.subprocess,'Popen',fail), self.assertRaises(h.Error) as error:
+                self.m.issue(jobdir)
+            self.assertEqual(captured['args'][-2:], ['--dns.resolvers','1.1.1.1:53'])
+            self.assertIn('Certificate DNS resolvers', str(error.exception))
+            self.assertNotIn('secret-token', str(error.exception))
 
 
 @unittest.skipUnless(os.environ.get('U2L_TEST_CADDY'), 'Set U2L_TEST_CADDY to run real HTTPS integration tests.')
@@ -215,6 +290,48 @@ class GatewayIntegrationTests(unittest.TestCase):
         with self.assertRaises(h.Error): self.m.store_certificate(b'garbage',self.key.read_bytes())
         self.assertEqual(h.read_json(self.m.active_file),old)
         with self.assertRaises(h.Error): h.certificate_info(self.cert,self.key,'wrong.example.test')
+
+    def test_automatic_renewal_failure_then_success_with_live_https(self):
+        self.settings.update(certificate_mode='dns',staging=False,dns_resolvers='1.1.1.1:53')
+        h.write_private(self.m.settings_file,self.settings)
+        h.write_private(self.m.base/'secrets.json',{'CF_DNS_API_TOKEN':'test-token'})
+        lego=self.m.tools/'lego'
+        lego.write_text('#!/bin/sh\nexit 1\n'); lego.chmod(0o700)
+        self.m.apply()
+        pid=self.m.process(); old=h.read_json(self.m.active_file)
+        real_popen=h.subprocess.Popen
+        def defer_worker(args, **kwargs):
+            if len(args)>2 and args[0]==sys.executable and args[2]=='worker':
+                return object()
+            return real_popen(args,**kwargs)
+        with patch.object(h.subprocess,'Popen',side_effect=defer_worker):
+            self.m.watchdog()
+        job=h.read_json(self.m.base/'job.json')
+        self.assertTrue(job['automatic'])
+        self.m.worker(job['id'])
+        self.assertEqual(self.m.renewal_status()['result'],'failed')
+        self.assertEqual(h.read_json(self.m.active_file),old)
+        self.assertEqual(self.m.process(),pid)
+        self.assertEqual(self.request('/camera/front/video.mjpeg')[0],200)
+        with patch.object(self.m,'enqueue') as enqueue:
+            self.m.watchdog(); enqueue.assert_not_called()
+        account=h.private_dir(self.m.base/'acme/production/certificates')
+        cert=account/(self.settings['domain']+'.crt'); key=account/(self.settings['domain']+'.key')
+        subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','60','-subj','/CN=camera.example.test','-addext','subjectAltName=DNS:camera.example.test','-keyout',str(key),'-out',str(cert)],check=True,capture_output=True)
+        lego.write_text('#!/bin/sh\nexit 0\n')
+        history=h.read_json(self.m.base/'renewal.json'); history['attempt']-=h.RENEW_RETRY+1
+        h.write_private(self.m.base/'renewal.json',history)
+        with patch.object(h.subprocess,'Popen',side_effect=defer_worker):
+            self.m.watchdog()
+        self.m.worker(h.read_json(self.m.base/'job.json')['id'])
+        self.assertEqual(self.m.renewal_status()['result'],'ready')
+        self.assertTrue(self.m.renewal_status()['last_success'])
+        self.assertNotEqual(h.read_json(self.m.active_file),old)
+        self.assertEqual(self.m.process(),pid)
+        self.cert=cert
+        self.assertEqual(self.request('/camera/front/video.mjpeg')[0],200)
+        self.assertEqual(self.request('/camera/front/video.mjpeg',auth=False)[0],401)
+        self.assertGreater(self.m.renewal_status()['next_attempt_at'],time.time()+29*86400)
     def test_busy_port_does_not_stop_other_service(self):
         self.settings['listen_port']=self.upstream.server_port
         self.settings['snapshot_port']=80

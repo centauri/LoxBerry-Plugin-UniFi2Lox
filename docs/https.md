@@ -46,9 +46,11 @@ Cloudflare requires a scoped API token with **Zone / DNS / Edit** and
 camera hostname in **DNS only** mode. The token edits challenge TXT records; the
 plugin does not configure Cloudflare proxying, DDNS or firewall rules.
 
-The UI defaults to Let's Encrypt **staging**. This tests account/challenge
-handling without issuing a trusted certificate. After staging succeeds, save with
-staging unchecked, request a production certificate and explicitly enable HTTPS.
+The UI defaults to Let's Encrypt **production** for normal use. Staging is available
+under **Advanced certificate testing** for testing account/challenge handling without
+issuing a trusted certificate. Saved staging selections are preserved on upgrade and
+the advanced section opens when staging is selected. After a staging test succeeds,
+save with staging unchecked, request a production certificate and explicitly enable HTTPS.
 Staging and production account/certificate directories are separate. Never disable
 certificate verification in Loxone to work around a staging certificate.
 
@@ -132,13 +134,17 @@ failed certificate import preservation and occupied-port handling. Other tests
 cover credentials, settings, operation locks, manual confirmation and renewal
 scheduling. These tests do not demonstrate live DNS-provider API compatibility.
 
+Confirmed on the SOYO LoxBerry test installation: Cloudflare staging and production
+issuance, authenticated HTTPS snapshot/video, unauthenticated HTTP 401 responses,
+remote playback in the Loxone app, and recovery after a complete LoxBerry reboot.
+The combined local test package passed 32 automated tests, including the existing
+VAAPI tests. This HTTPS branch is separate from the VAAPI branch.
+
 Before marking a PR ready for production:
 
-- Test Cloudflare staging and production issuance on a real LoxBerry.
 - Test manual DNS issuance, cancellation, reboot interruption and renewal.
 - Test each additional provider with an appropriately scoped test account.
-- Verify video/snapshot authentication and reconnect over mobile internet in
-  supported Loxone app versions. Browsers succeeding does not prove app support.
+- Broaden mobile playback/reconnect testing to other supported Loxone app versions.
 - Exercise renewal and LoxBerry upgrade/rollback with real installation hooks.
 - Review dependency footprint and platform compatibility with the maintainer;
   complete UI translations if required by the project.
@@ -147,3 +153,37 @@ References: [lego DNS providers](https://go-acme.github.io/lego/dns/),
 [lego exec provider](https://go-acme.github.io/lego/dns/exec/),
 [Cloudflare token requirements](https://go-acme.github.io/lego/dns/cloudflare/),
 [Caddy JSON configuration](https://caddyserver.com/docs/json/).
+
+### Certificate DNS resolvers
+
+The optional Certificate DNS resolvers field accepts comma-separated IP:port values,
+for example `1.1.1.1:53` or `[2606:4700:4700::1111]:53`. Blank preserves system DNS.
+This applies to automated and manual DNS certificate requests and renewals, not the
+host resolver configuration. Use a reachable resolver returning public DNS records;
+outbound DNS access is required. Propagation verification remains enabled.
+
+During the SOYO test, the local resolver did not return the challenge
+TXT record. Retrying against 1.1.1.1 completed Cloudflare staging issuance successfully.
+The user subsequently confirmed production HTTPS, snapshot/video access, rejection without credentials, remote Loxone playback and HTTPS after a full reboot. A real CA renewal remains unverified.
+
+### Automatic renewal status and recovery
+
+Automatic renewal is enabled whenever managed HTTPS is enabled with automatic DNS
+validation and an active certificate matching the hostname and staging selection.
+No extra cron job is needed: the plugin's existing minute watchdog schedules it.
+The status page shows whether renewal is active, the earliest next attempt, the
+last successful automatic check and any failed attempt. The configured DNS resolver
+and saved provider credentials are reused. Manual TXT and imported certificates
+still require intervention. The camera service must remain enabled.
+
+The scheduler starts at 30 days before expiry and retries at most every 12 hours.
+Attempt timestamps survive reboot. Overlapping watchdogs cannot enqueue duplicate
+renewals, and a busy job does not consume the retry window. Successful issuance
+validates the certificate/key before reloading the running gateway. Failed issuance
+keeps the old certificate; an expired certificate is not served. No forced
+production renewal is performed during installation.
+
+Local tests exercise failure/retry, restart persistence, both DNS validation modes'
+resolver arguments, and automatic worker success/failure against a real local HTTPS
+gateway with simulated certificate issuance. These do not replace a real ACME
+renewal test.
